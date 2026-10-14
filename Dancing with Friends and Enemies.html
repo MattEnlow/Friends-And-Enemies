@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Dancing with Friends and Enemies</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);--stage:#000000;--fg:#e8eaf0;color-scheme:dark}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--stage:#000000;--fg:#e8eaf0}}
+:root[data-theme="dark"]{--stage:#000000;--fg:#e8eaf0}
+html,body{height:100%;margin:0;overflow:hidden;background:var(--stage)}
+canvas#c{position:fixed;inset:0;width:100%;height:100%;display:block;touch-action:none}
+#err{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;padding:24px;color:var(--fg);font-family:system-ui,sans-serif;text-align:center}
+#err[hidden]{display:none}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="err" hidden></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function(){
+"use strict";
+
+function fail(msg){
+  const d=document.getElementById('err'); d.textContent = msg; d.hidden = false;
+}
+if (typeof THREE === 'undefined') { fail('Three.js did not load. Check your connection and reload the page.'); return; }
+
+/* ---------- renderer ---------- */
+const canvas = document.getElementById('c');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({canvas, antialias:false, powerPreference:'high-performance'});
+} catch(e){ fail('WebGL is not available in this browser.'); return; }
+renderer.autoClear = false;
+renderer.setClearColor(0x000000, 1);
+const PR = Math.min(window.devicePixelRatio || 1, 2);
+renderer.setPixelRatio(PR);
+renderer.setSize(window.innerWidth, window.innerHeight);
+
+const isGL2 = renderer.capabilities.isWebGL2;
+const floatRT = isGL2 ? !!renderer.extensions.get('EXT_color_buffer_float')
+                      : !!renderer.extensions.get('OES_texture_float');
+if (!floatRT){ fail('This GPU/browser cannot render to floating-point textures, which the simulation needs. Try a recent desktop Chrome, Firefox, Edge or Safari.'); return; }
+const maxTex = renderer.capabilities.maxTextureSize;
+
+/* ---------- parameters ---------- */
+const P = {
+  n: 100000, dim: 3,
+  a: 0.02, b: 0.01, pull: 0.005, soft: 0.01,
+  logRate: -4, spf: 1,
+  colorMode: 0, cs: 50, ps: 0.8, alpha: 0.5,
+  autoRot: false, paused: false
+};
+const N_OPTIONS = [1000, 10000, 100000, 1000000, 4000000];
+const LOOK = { 1000:[4,1], 10000:[2.6,0.85], 100000:[1.6,0.5], 1000000:[1.0,0.22], 4000000:[1.0,0.1] };
+
+/* ---------- shared GPGPU plumbing ---------- */
+const quadCam = new THREE.OrthographicCamera(-1,1,1,-1,0,1);
+const quadScene = new THREE.Scene();
+const quad = new THREE.Mesh(new THREE.PlaneGeometry(2,2));
+quad.frustumCulled = false;
+quadScene.add(quad);
+
+const QUAD_VS = 'void main(){ gl_Position = vec4(position.xy, 0.0, 1.0); }';
+
+const copyMat = new THREE.ShaderMaterial({
+  uniforms:{ tSrc:{value:null}, side:{value:1} },
+  vertexShader: QUAD_VS,
+  fragmentShader: `
+    uniform sampler2D tSrc; uniform float side;
+    void main(){ gl_FragColor = texture2D(tSrc, gl_FragCoord.xy / side); }`,
+  depthTest:false, depthWrite:false
+});
+
+// One synchronous step of  x <- (1-pull) x + a f(x_friend - x) - b f(x_enemy - x),  f(d) = d/(soft+|d|)
+const stepMat = new THREE.ShaderMaterial({
+  uniforms:{ tPos:{value:null}, tLinks:{value:null}, side:{value:1},
+             damp:{value:0.995}, a:{value:0.02}, b:{value:0.01}, soft:{value:0.01} },
+  vertexShader: QUAD_VS,
+  fragmentShader: `
+    uniform sampler2D tPos, tLinks;
+    uniform float side, damp, a, b, soft;
+    vec3 F(vec3 d){ return d / (soft + length(d)); }
+    void main(){
+      vec2 uv = gl_FragCoord.xy / side;
+      vec3 x  = texture2D(tPos, uv).xyz;
+      vec4 L  = texture2D(tLinks, uv);
+      vec3 xf = texture2D(tPos, L.xy).xyz;
+      vec3 xe = texture2D(tPos, L.zw).xyz;
+      vec3 nx = damp * x + a * F(xf - x) - b * F(xe - x);
+      gl_FragColor = vec4(nx, length(nx - x));   // w = speed, used for colouring
+    }`,
+  depthTest:false, depthWrite:false
+});
+
+// Scattered writes: each rewired dancer is a 1-pixel point drawn onto its own texel of the links texture
+const rewireMat = new THREE.ShaderMaterial({
+  vertexShader: `
+    attribute vec4 link; varying vec4 vLink;
+    void main(){ vLink = link; gl_Position = vec4(position.xy, 0.0, 1.0); gl_PointSize = 1.0; }`,
+  fragmentShader: `
+    varying vec4 vLink;
+    void main(){ gl_FragColor = vLink; }`,
+  depthTest:false, depthWrite:false, blending:THREE.NoBlending
+});
+const rewireScene = new THREE.Scene();
+
+/* ---------- display ---------- */
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(40, window.innerWidth/window.innerHeight, 0.01, 200);
+camera.position.set(0,0,6.2);
+const controls = new THREE.OrbitControls(camera, canvas);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.autoRotateSpeed = 0.6;
+controls.enablePan = false;
+
+const displayMat = new THREE.ShaderMaterial({
+  uniforms:{ tPos:{value:null}, size:{value:2}, alpha:{value:1}, cs:{value:50},
+             mode:{value:0}, persp:{value:0}, pr:{value:PR} },
+  vertexShader: `
+    uniform sampler2D tPos; uniform float size, cs, mode, persp, pr;
+    varying vec3 vCol;
+    vec3 temp(float t){
+      vec3 c0=vec3(0.10,0.22,0.95), c1=vec3(0.20,0.72,1.0), c2=vec3(1.0), c3=vec3(1.0,0.62,0.18), c4=vec3(0.95,0.16,0.10);
+      t = clamp(t,0.0,1.0)*4.0;
+      if(t<1.0) return mix(c0,c1,t);
+      if(t<2.0) return mix(c1,c2,t-1.0);
+      if(t<3.0) return mix(c2,c3,t-2.0);
+      return mix(c3,c4,t-3.0);
+    }
+    vec3 hue(float h){ return clamp(abs(mod(h*6.0+vec3(0.0,4.0,2.0),6.0)-3.0)-1.0,0.0,1.0); }
+    void main(){
+      vec4 P = texture2D(tPos, position.xy);
+      vec4 mv = modelViewMatrix * vec4(P.xyz, 1.0);
+      gl_Position = projectionMatrix * mv;
+      float att = persp > 0.5 ? clamp(6.2 / -mv.z, 0.3, 4.0) : 1.0;
+      gl_PointSize = max(1.0, size * pr * att);
+      if (mode < 0.5)      vCol = temp(P.w * cs);
+      else if (mode < 1.5) vCol = mix(hue(position.z), vec3(1.0), 0.12);
+      else                 vCol = vec3(0.92,0.94,1.0);
+    }`,
+  fragmentShader: `
+    uniform float alpha, size;
+    varying vec3 vCol;
+    void main(){
+      float a = alpha;
+      if (size > 2.5) {
+        float r = length(gl_PointCoord - 0.5);
+        a *= smoothstep(0.5, 0.32, r);
+      }
+      gl_FragColor = vec4(vCol, a);
+    }`,
+  transparent:true, depthTest:false, depthWrite:false, blending:THREE.AdditiveBlending
+});
+
+/* ---------- simulation state ---------- */
+let side = 1, total = 1;
+let posRT = [null,null], linkRT = null, cur = 0;
+let points = null, rewirePts = null, rewireCap = 0;
+let rwPos = null, rwLink = null;
+
+function makeRT(s){
+  return new THREE.WebGLRenderTarget(s, s, {
+    minFilter:THREE.NearestFilter, magFilter:THREE.NearestFilter,
+    wrapS:THREE.ClampToEdgeWrapping, wrapT:THREE.ClampToEdgeWrapping,
+    format:THREE.RGBAFormat, type:THREE.FloatType,
+    depthBuffer:false, stencilBuffer:false
+  });
+}
+function dataTex(arr, s){
+  const t = new THREE.DataTexture(arr, s, s, THREE.RGBAFormat, THREE.FloatType);
+  t.minFilter = t.magFilter = THREE.NearestFilter;
+  t.needsUpdate = true;
+  return t;
+}
+function copyInto(tex, rt){
+  copyMat.uniforms.tSrc.value = tex;
+  copyMat.uniforms.side.value = side;
+  quad.material = copyMat;
+  renderer.setRenderTarget(rt);
+  renderer.render(quadScene, quadCam);
+}
+const uOf = i => ((i % side) + 0.5) / side;
+const vOf = i => (Math.floor(i / side) + 0.5) / side;
+
+function randomLinksTexture(){
+  const L = new Float32Array(total*4);
+  const n = P.n;
+  for (let i=0;i<total;i++){
+    let f, e;
+    if (i < n){ f = (Math.random()*n)|0; e = (Math.random()*n)|0; }
+    else { f = e = i; }                    // padding texels point at themselves and never move
+    const k = i*4;
+    L[k]=uOf(f); L[k+1]=vOf(f); L[k+2]=uOf(e); L[k+3]=vOf(e);
+  }
+  return dataTex(L, side);
+}
+
+function build(){
+  // tear down
+  if (posRT[0]) { posRT[0].dispose(); posRT[1].dispose(); linkRT.dispose(); }
+  if (points) { scene.remove(points); points.geometry.dispose(); }
+  if (rewirePts) { rewireScene.remove(rewirePts); rewirePts.geometry.dispose(); }
+
+  const n = P.n;
+  side = Math.ceil(Math.sqrt(n));
+  if (side > maxTex) { fail('This GPU cannot hold that many dancers. Pick a smaller number.'); return; }
+  total = side*side;
+
+  posRT = [makeRT(side), makeRT(side)];
+  linkRT = makeRT(side);
+  cur = 0;
+
+  // initial positions: uniform in [-1,1]^d, exactly as in the Mathematica code
+  const X = new Float32Array(total*4);
+  for (let i=0;i<n;i++){
+    const k=i*4;
+    X[k]=Math.random()*2-1; X[k+1]=Math.random()*2-1;
+    X[k+2]= P.dim===3 ? Math.random()*2-1 : 0;
+  }
+  const xt = dataTex(X, side); copyInto(xt, posRT[0]); xt.dispose();
+  const lt = randomLinksTexture(); copyInto(lt, linkRT); lt.dispose();
+
+  // display points: position attribute = (u, v, identity in [0,1))
+  const ref = new Float32Array(n*3);
+  for (let i=0;i<n;i++){ ref[i*3]=uOf(i); ref[i*3+1]=vOf(i); ref[i*3+2]=i/n; }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(ref,3));
+  points = new THREE.Points(g, displayMat);
+  points.frustumCulled = false;
+  scene.add(points);
+
+  // scatter-write buffers for re-choosing friends and enemies
+  rewireCap = Math.min(n, 1<<18);
+  rwPos = new Float32Array(rewireCap*3);
+  rwLink = new Float32Array(rewireCap*4);
+  const rg = new THREE.BufferGeometry();
+  rg.setAttribute('position', new THREE.BufferAttribute(rwPos,3).setUsage(THREE.DynamicDrawUsage));
+  rg.setAttribute('link', new THREE.BufferAttribute(rwLink,4).setUsage(THREE.DynamicDrawUsage));
+  rg.setDrawRange(0,0);
+  rewirePts = new THREE.Points(rg, rewireMat);
+  rewirePts.frustumCulled = false;
+  rewireScene.add(rewirePts);
+
+  // camera
+  camera.position.set(0,0,6.2); camera.up.set(0,1,0);
+  controls.target.set(0,0,0);
+  controls.enableRotate = P.dim === 3;
+  controls.update();
+  displayMat.uniforms.persp.value = P.dim === 3 ? 1 : 0;
+}
+
+function rewireAll(){
+  const lt = randomLinksTexture(); copyInto(lt, linkRT); lt.dispose();
+}
+
+/* Poisson(lambda) number of dancers changing heart this step */
+function gauss(){ let u=0,v=0; while(!u)u=Math.random(); while(!v)v=Math.random(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+function poisson(l){
+  if (l <= 0) return 0;
+  if (l < 30){ const L=Math.exp(-l); let k=0,p=1; do{k++;p*=Math.random();}while(p>L); return k-1; }
+  return Math.max(0, Math.round(l + Math.sqrt(l)*gauss()));
+}
+
+let rewiredCount = 0;
+function step(){
+  const n = P.n;
+  // 1) a few dancers re-choose friend and enemy (independent uniform picks, like p[[r]]=r; q[[r]]=r)
+  const k = Math.min(poisson(n * Math.pow(10, P.logRate)), rewireCap);
+  if (k > 0){
+    for (let j=0;j<k;j++){
+      const i = (Math.random()*n)|0, f = (Math.random()*n)|0, e = (Math.random()*n)|0;
+      rwPos[j*3]   = uOf(i)*2-1;
+      rwPos[j*3+1] = vOf(i)*2-1;
+      rwPos[j*3+2] = 0;
+      rwLink[j*4]=uOf(f); rwLink[j*4+1]=vOf(f); rwLink[j*4+2]=uOf(e); rwLink[j*4+3]=vOf(e);
+    }
+    const g = rewirePts.geometry;
+    g.attributes.position.updateRange = {offset:0, count:k*3};
+    g.attributes.link.updateRange = {offset:0, count:k*4};
+    g.attributes.position.needsUpdate = true;
+    g.attributes.link.needsUpdate = true;
+    g.setDrawRange(0,k);
+    renderer.setRenderTarget(linkRT);
+    renderer.render(rewireScene, quadCam);
+    rewiredCount += k;
+  }
+  // 2) everyone moves at once
+  const u = stepMat.uniforms;
+  u.tPos.value = posRT[cur].texture;
+  u.tLinks.value = linkRT.texture;
+  u.side.value = side;
+  u.damp.value = 1 - P.pull; u.a.value = P.a; u.b.value = P.b; u.soft.value = P.soft;
+  quad.material = stepMat;
+  renderer.setRenderTarget(posRT[1-cur]);
+  renderer.render(quadScene, quadCam);
+  cur = 1 - cur;
+}
+
+
+window.addEventListener('resize', () => {
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+});
+build();
+const u = displayMat.uniforms;
+u.size.value = P.ps; u.alpha.value = P.alpha; u.cs.value = P.cs; u.mode.value = P.colorMode;
+function frame(){
+  requestAnimationFrame(frame);
+  for (let s=0;s<P.spf;s++) step();
+  controls.update();
+  u.tPos.value = posRT[cur].texture;
+  renderer.setRenderTarget(null);
+  renderer.clear();
+  renderer.render(scene, camera);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
